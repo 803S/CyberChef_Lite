@@ -294,9 +294,9 @@
         triggerBtn = document.createElement('div');
         triggerBtn.className = 'trigger-btn';
         triggerBtn.innerHTML = '⚡️';
-        // 初始位置在选区附近
-        triggerBtn.style.left = (x + 10) + 'px';
-        triggerBtn.style.top = (y + 10) + 'px';
+        // 初始位置离选区远一点，防止遮挡
+        triggerBtn.style.left = (x + 30) + 'px';
+        triggerBtn.style.top = (y + 30) + 'px';
         
         triggerBtn.onmousedown = (e) => e.stopPropagation(); // 防止触发拖拽
         triggerBtn.onclick = (e) => {
