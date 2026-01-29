@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         CyberChef Lite (Draggable & Replace)
+// @name         CyberChef Pro (Auto-Decode & Beautify)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  网页划词解码工具。新特性：1.按住标题栏可拖拽 2.支持将结果替换回原文。
+// @version      2.0
+// @description  高级网络安全解码工具。支持自动探测编码、JS/JSON美化、自由缩放、智能替换。
 // @author       You
 // @match        *://*/*
 // @grant        GM_setClipboard
@@ -12,46 +12,74 @@
 (function() {
     'use strict';
 
-    // --- 核心解码逻辑库---
-    const Decoders = {
+    // --- 1. 核心解码与格式化库 ---
+    const Tools = {
+        // Hex
         hex: (str) => {
             const cleanStr = str.replace(/\s+|0x|\\x/gi, '');
-            if (cleanStr.length % 2 !== 0) throw new Error("Hex 长度必须为偶数");
+            if (cleanStr.length % 2 !== 0) throw new Error("Hex长度需为偶数");
+            if (/[^0-9a-fA-F]/.test(cleanStr)) throw new Error("非Hex字符");
             const byteArray = new Uint8Array(cleanStr.length / 2);
             for (let i = 0; i < cleanStr.length; i += 2) {
                 byteArray[i / 2] = parseInt(cleanStr.substr(i, 2), 16);
             }
             return new TextDecoder('utf-8').decode(byteArray);
         },
-        url: (str) => decodeURIComponent(str),
+        // URL
+        url: (str) => {
+            if (!/%/.test(str)) throw new Error("无URL编码特征");
+            return decodeURIComponent(str);
+        },
+        // Base64
         base64: (str) => {
+            // 简单的正则检查，避免把普通英文当B64解
+            if (!/^[A-Za-z0-9+/=]+$/.test(str.trim()) || str.length % 4 !== 0) throw new Error("非标准Base64");
             const binaryString = atob(str.trim());
             const bytes = Uint8Array.from(binaryString, c => c.charCodeAt(0));
             return new TextDecoder('utf-8').decode(bytes);
         },
+        // PowerShell Base64
         psBase64: (str) => {
             const binaryString = atob(str.trim());
             const bytes = Uint8Array.from(binaryString, c => c.charCodeAt(0));
             return new TextDecoder('utf-16le').decode(bytes);
         },
+        // Unicode
         unicode: (str) => {
-            if(!str.includes('\\u')) return str;
+            if(!str.includes('\\u')) throw new Error("无Unicode特征");
             return JSON.parse(`"${str}"`);
         },
-        smart: (str) => {
-            let res = str;
-            try { res = decodeURIComponent(res); } catch(e){}
+        // JS/JSON 美化 (简易版，不依赖庞大的库)
+        beautify: (str) => {
             try {
-                const cleanHex = res.replace(/\s+|0x|\\x|%/g, '');
-                if(/^[0-9a-fA-F]+$/.test(cleanHex) && cleanHex.length > 4) {
-                     res = Decoders.hex(cleanHex);
+                // 尝试作为JSON格式化
+                const obj = JSON.parse(str);
+                return JSON.stringify(obj, null, 4);
+            } catch (e) {
+                // 简单的 JS/通用代码 格式化 (缩进处理)
+                let res = '';
+                let indent = 0;
+                const clean = str.replace(/\s+/g, ' '); // 压缩空白
+                for (let i = 0; i < clean.length; i++) {
+                    const char = clean[i];
+                    if (char === '{' || char === '[') {
+                        res += char + '\n' + '    '.repeat(++indent);
+                    } else if (char === '}' || char === ']') {
+                        res += '\n' + '    '.repeat(--indent) + char;
+                    } else if (char === ',') {
+                        res += char + '\n' + '    '.repeat(indent);
+                    } else if (char === ';') {
+                         res += char + '\n' + '    '.repeat(indent);
+                    } else {
+                        res += char;
+                    }
                 }
-            } catch(e){}
-            return res;
+                return res;
+            }
         }
     };
 
-    // --- UI 构建 ---
+    // --- 2. UI 样式 (Shadow DOM) ---
     const host = document.createElement('div');
     host.style.cssText = 'position: absolute; z-index: 2147483647; top: 0; left: 0; pointer-events: none;';
     document.body.appendChild(host);
@@ -59,132 +87,199 @@
 
     const style = document.createElement('style');
     style.textContent = `
+        /* 触发按钮 */
         .trigger-btn {
             pointer-events: auto;
             position: absolute;
-            width: 30px;
-            height: 30px;
-            background: #2196F3;
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             border-radius: 50%;
             color: white;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
-            font-size: 14px;
-            transition: transform 0.2s;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            font-size: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            z-index: 10000;
         }
-        .trigger-btn:hover { transform: scale(1.1); }
-        
+        .trigger-btn:hover { transform: scale(1.15); box-shadow: 0 6px 8px rgba(0,0,0,0.4); }
+
+        /* 主面板 */
         .panel {
             pointer-events: auto;
             position: fixed;
-            width: 420px;
-            background: #2b2b2b;
-            color: #e0e0e0;
+            width: 500px;
+            height: 350px;
+            /* 关键：允许调整大小 */
+            resize: both;
+            overflow: hidden; 
+            min-width: 350px;
+            min-height: 250px;
+            
+            background: rgba(30, 30, 30, 0.95);
+            backdrop-filter: blur(10px);
+            color: #f0f0f0;
             border: 1px solid #444;
             border-radius: 8px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.6);
-            padding: 0; /* padding移到内部元素，为了header贴边 */
-            font-family: Consolas, Monaco, monospace;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.7);
+            font-family: 'Segoe UI', Consolas, monospace;
             display: flex;
             flex-direction: column;
             opacity: 0;
-            transition: opacity 0.1s;
+            transition: opacity 0.15s ease-out;
         }
 
+        /* 标题栏 */
         .panel-header {
-            background: #333;
-            padding: 8px 10px;
-            border-bottom: 1px solid #444;
-            border-radius: 8px 8px 0 0;
-            cursor: move; /* 关键：显示拖动光标 */
+            background: #252526;
+            padding: 8px 12px;
+            border-bottom: 1px solid #3e3e42;
+            cursor: move;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            user-select: none; /* 防止拖动时选中文字 */
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            flex-shrink: 0;
         }
-        .panel-header:hover { background: #3a3a3a; }
+        .panel-header:hover { background: #2d2d30; }
 
-        .panel-body { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
-        
+        /* 内容区 */
+        .panel-body {
+            flex: 1;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            overflow: hidden;
+        }
+
+        /* 文本域 */
         .result-box {
+            flex: 1; /* 自动撑满剩余高度 */
             width: 100%;
-            min-height: 100px;
-            max-height: 400px;
             background: #1e1e1e;
-            color: #00ff00;
-            border: 1px solid #333;
-            padding: 5px;
+            color: #dcdcaa;
+            border: 1px solid #3e3e42;
+            padding: 8px;
             box-sizing: border-box;
-            resize: vertical; /* 允许调整高度 */
-            font-size: 12px;
-            overflow: auto;
+            resize: none; /* 由面板整体resize控制 */
+            font-size: 13px;
+            font-family: Consolas, 'Courier New', monospace;
+            outline: none;
+            line-height: 1.4;
+        }
+        .result-box:focus { border-color: #007acc; }
+
+        /* 按钮组 */
+        .btn-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            flex-shrink: 0;
         }
 
-        .btn-group { display: flex; flex-wrap: wrap; gap: 5px; }
-
+        /* 按钮样式 */
         button {
-            background: #444;
-            color: white;
-            border: 1px solid #555;
-            padding: 4px 8px;
+            background: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #3c3c3c;
+            padding: 5px 10px;
             cursor: pointer;
-            border-radius: 4px;
+            border-radius: 3px;
             font-size: 12px;
+            transition: all 0.1s;
         }
-        button:hover { background: #555; }
-        button.primary { background: #2196F3; border-color: #1976D2; }
-        button.special { background: #9C27B0; border-color: #7B1FA2; }
-        button.danger { background: #d32f2f; border-color: #b71c1c; }
-        button.replace { background: #ff9800; border-color: #f57c00; color: black; font-weight: bold; }
+        button:hover { background: #4a4a4a; color: white; }
+        
+        /* 激活状态 */
+        button.active { background: #0e639c; color: white; border-color: #0e639c; font-weight: bold;}
+        
+        /* 特殊按钮颜色 */
+        button.action-btn { background: #2d2d30; border-color: #555; }
+        button.replace { background: #ce723b; color: white; }
+        button.replace:hover { background: #e08855; }
+        button.close { background: #c53030; color: white; }
+        button.close:hover { background: #e53e3e; }
 
-        .status { font-size: 11px; color: #aaa; }
+        /* 底部状态 */
+        .status-bar {
+            font-size: 11px;
+            color: #858585;
+            display: flex;
+            justify-content: space-between;
+            margin-top: 4px;
+        }
     `;
     shadow.appendChild(style);
 
+    // --- 3. 全局变量 ---
     let selectedText = '';
-    let selectedRange = null; // 保存选区对象，用于替换
+    let selectedRange = null;
     let triggerBtn = null;
     let panel = null;
-
-    // --- 拖拽相关的全局变量 ---
+    
     let isDragging = false;
-    let dragOffsetX = 0;
-    let dragOffsetY = 0;
+    let dragOffsetX = 0, dragOffsetY = 0;
 
-    // --- 事件监听 ---
-    document.addEventListener('mouseup', (e) => {
-        // 如果正在拖拽面板，不要触发选词逻辑
-        if (isDragging) {
-            isDragging = false;
-            return;
+    // --- 4. 自动探测逻辑 ---
+    function autoDetect(text) {
+        text = text.trim();
+        // 1. 优先尝试 Unicode (特征明显)
+        if (text.includes('\\u')) {
+            try { return { type: 'unicode', res: Tools.unicode(text) }; } catch(e){}
         }
+        // 2. URL 解码 (如果包含%且解码后变短)
+        if (text.includes('%')) {
+            try {
+                const res = Tools.url(text);
+                if (res !== text) return { type: 'url', res: res };
+            } catch(e){}
+        }
+        // 3. Hex 检测 (只有0-9A-F)
+        if (/^[0-9a-fA-F\s]+$/.test(text) && text.replace(/\s/g,'').length > 4) {
+             try { return { type: 'hex', res: Tools.hex(text) }; } catch(e){}
+        }
+        // 4. Base64 (最后尝试，因为容易误判)
+        // 只有当看起来像乱码或者符合Base64特征时才试
+        if (/^[A-Za-z0-9+/=]+$/.test(text) && text.length > 8) {
+             try { return { type: 'base64', res: Tools.base64(text) }; } catch(e){}
+        }
+        
+        // 默认返回原文
+        return { type: 'raw', res: text };
+    }
 
+    // --- 5. 事件监听 ---
+    document.addEventListener('mouseup', (e) => {
+        if (isDragging) { isDragging = false; return; } // 拖拽结束不触发
+
+        // 延时等待选区稳定
         setTimeout(() => {
             const selection = window.getSelection();
+            if (selection.rangeCount === 0) return;
+            
             const text = selection.toString().trim();
-            
-            // 如果点击的是面板内部，不处理
-            if (host.contains(e.target)) return;
-            
+            if (host.contains(e.target)) return; // 点击面板内部忽略
+
             removeUI();
 
             if (text.length > 0) {
                 selectedText = text;
-                if (selection.rangeCount > 0) {
-                    selectedRange = selection.getRangeAt(0).cloneRange(); // 克隆选区以备替换使用
-                }
-                showTrigger(e.pageX, e.pageY + 10);
+                selectedRange = selection.getRangeAt(0).cloneRange();
+                showTrigger(e.pageX, e.pageY);
             }
         }, 10);
     });
 
-    // 全局移动事件（用于拖拽）
+    // 拖拽移动
     document.addEventListener('mousemove', (e) => {
         if (isDragging && panel) {
-            e.preventDefault(); // 防止拖动时选中文本
+            e.preventDefault();
             panel.style.left = (e.clientX - dragOffsetX) + 'px';
             panel.style.top = (e.clientY - dragOffsetY) + 'px';
         }
@@ -199,9 +294,11 @@
         triggerBtn = document.createElement('div');
         triggerBtn.className = 'trigger-btn';
         triggerBtn.innerHTML = '⚡️';
-        triggerBtn.style.left = x + 'px';
-        triggerBtn.style.top = y + 'px';
+        // 初始位置在选区附近
+        triggerBtn.style.left = (x + 10) + 'px';
+        triggerBtn.style.top = (y + 10) + 'px';
         
+        triggerBtn.onmousedown = (e) => e.stopPropagation(); // 防止触发拖拽
         triggerBtn.onclick = (e) => {
             e.stopPropagation();
             showPanel(e.clientX, e.clientY);
@@ -211,127 +308,183 @@
         shadow.appendChild(triggerBtn);
     }
 
+    // --- 6. 构建主面板 ---
     function showPanel(mouseX, mouseY) {
         panel = document.createElement('div');
         panel.className = 'panel';
         
+        // 自动探测
+        const autoResult = autoDetect(selectedText);
+        const initialContent = autoResult.type === 'raw' ? selectedText : autoResult.res;
+        
         panel.innerHTML = `
             <div class="panel-header" id="drag-handle">
-                <span style="font-weight:bold;">✨ 解码助手 (按住拖动)</span>
-                <span class="status" id="status-msg">Len: ${selectedText.length}</span>
+                <span>CyberChef Pro</span>
+                <span style="font-weight:normal; opacity:0.7">按住拖动 | 右下角缩放</span>
             </div>
             <div class="panel-body">
-                <textarea class="result-box" id="output-area">${escapeHtml(selectedText)}</textarea>
-                <div class="btn-group">
-                    <button id="btn-hex">Hex->Str</button>
-                    <button id="btn-url">URL Dec</button>
-                    <button id="btn-uni">Unicode</button>
-                    <button id="btn-b64">Base64</button>
-                    <button id="btn-ps" class="special" title="UTF-16LE Decode">PS Base64</button>
-                    <button id="btn-smart" class="primary">智能尝试</button>
+                <textarea class="result-box" id="output-area" spellcheck="false"></textarea>
+                
+                <!-- 解码器按钮区 -->
+                <div class="btn-group" id="decoder-group">
+                    <button data-type="hex" id="btn-hex">Hex</button>
+                    <button data-type="url" id="btn-url">URL</button>
+                    <button data-type="base64" id="btn-b64">Base64</button>
+                    <button data-type="psBase64" id="btn-ps" style="border-color:#9C27B0">PS-B64</button>
+                    <button data-type="unicode" id="btn-uni">Unicode</button>
+                    <!-- 格式化功能 -->
+                    <button id="btn-fmt" class="action-btn" title="格式化JS或JSON">✨ JS美化</button>
                 </div>
-                <div class="btn-group" style="margin-top:5px; border-top:1px solid #444; padding-top:5px;">
-                     <button id="btn-replace" class="replace" title="用当前结果替换网页原文">⚠️ 替换原文</button>
-                     <button id="btn-copy">复制结果</button>
-                     <button id="btn-use-result">👆 套娃(作为输入)</button>
-                     <button id="btn-close" class="danger" style="margin-left:auto;">关闭</button>
+
+                <!-- 操作按钮区 -->
+                <div class="status-bar">
+                    <div class="btn-group">
+                         <button id="btn-replace" class="replace">替换原文</button>
+                         <button id="btn-copy" class="action-btn">复制</button>
+                    </div>
+                    <div style="display:flex; gap:5px; align-items:center">
+                        <span id="status-text">Ready</span>
+                        <button id="btn-close" class="close">×</button>
+                    </div>
                 </div>
             </div>
         `;
 
         shadow.appendChild(panel);
+        
+        const outputArea = shadow.getElementById('output-area');
+        outputArea.value = initialContent; // 设置内容
 
-        // --- 位置自适应逻辑 ---
+        // 高亮自动探测到的类型
+        if(autoResult.type !== 'raw') {
+            const btn = shadow.querySelector(`button[data-type="${autoResult.type}"]`);
+            if(btn) btn.classList.add('active');
+            shadow.getElementById('status-text').textContent = `Auto: ${autoResult.type}`;
+        }
+
+        // --- 智能定位 (防止出屏) ---
         const rect = panel.getBoundingClientRect();
-        const viewportWidth = window.innerWidth;
-        const viewportHeight = window.innerHeight;
-        let finalX = mouseX + 10;
-        let finalY = mouseY + 10;
-
-        if (finalX + rect.width > viewportWidth) finalX = mouseX - rect.width - 10;
-        if (finalY + rect.height > viewportHeight) finalY = mouseY - rect.height - 10;
+        let finalX = mouseX + 20;
+        let finalY = mouseY + 20;
+        
+        if (finalX + rect.width > window.innerWidth) finalX = mouseX - rect.width - 10;
+        if (finalY + rect.height > window.innerHeight) finalY = mouseY - rect.height - 10;
         if (finalX < 0) finalX = 10;
         if (finalY < 0) finalY = 10;
 
         panel.style.left = finalX + 'px';
         panel.style.top = finalY + 'px';
-        panel.style.opacity = '1';
+        requestAnimationFrame(() => panel.style.opacity = '1');
 
-        bindEvents();
+        bindPanelEvents(outputArea, autoResult.type);
     }
 
-    function bindEvents() {
-        const outputArea = shadow.getElementById('output-area');
-        const statusMsg = shadow.getElementById('status-msg');
+    // --- 7. 面板交互逻辑 ---
+    function bindPanelEvents(textarea, currentType) {
+        const status = shadow.getElementById('status-text');
         const dragHandle = shadow.getElementById('drag-handle');
-        
-        // --- 绑定拖拽逻辑 ---
+        const decoderGroup = shadow.getElementById('decoder-group');
+
+        // 拖拽逻辑
         dragHandle.onmousedown = (e) => {
             isDragging = true;
-            // 计算鼠标点击点相对于面板左上角的偏移
             const rect = panel.getBoundingClientRect();
             dragOffsetX = e.clientX - rect.left;
             dragOffsetY = e.clientY - rect.top;
         };
 
-        const updateOutput = (result, type) => {
-            outputArea.value = result;
-            statusMsg.textContent = `${type} OK`;
-            statusMsg.style.color = '#4caf50';
-        };
-        const handleError = (err) => {
-            statusMsg.textContent = `Error`;
-            statusMsg.title = err.message;
-            statusMsg.style.color = '#f44336';
-        };
-        const getCurrentInput = () => outputArea.value;
-
-        // 解码按钮
-        shadow.getElementById('btn-hex').onclick = () => { try { updateOutput(Decoders.hex(getCurrentInput()), 'Hex'); } catch(e) { handleError(e); }};
-        shadow.getElementById('btn-url').onclick = () => { try { updateOutput(Decoders.url(getCurrentInput()), 'URL'); } catch(e) { handleError(e); }};
-        shadow.getElementById('btn-uni').onclick = () => { try { updateOutput(Decoders.unicode(getCurrentInput()), 'Unicode'); } catch(e) { handleError(e); }};
-        shadow.getElementById('btn-b64').onclick = () => { try { updateOutput(Decoders.base64(getCurrentInput()), 'Base64'); } catch(e) { handleError(e); }};
-        shadow.getElementById('btn-ps').onclick = () => { try { updateOutput(Decoders.psBase64(getCurrentInput()), 'PS B64'); } catch(e) { handleError(e); }};
-        shadow.getElementById('btn-smart').onclick = () => { try { updateOutput(Decoders.smart(getCurrentInput()), 'Smart'); } catch(e) { handleError(e); }};
-
-        // 功能按钮
-        shadow.getElementById('btn-copy').onclick = () => {
-            navigator.clipboard.writeText(outputArea.value);
-            statusMsg.textContent = "Copied";
-        };
-        
-        // --- 替换原文逻辑 ---
-        shadow.getElementById('btn-replace').onclick = () => {
-            const newText = outputArea.value;
-            if (!selectedRange) {
-                statusMsg.textContent = "无法定位原文";
-                return;
-            }
+        // 通用解码处理
+        const doDecode = (type) => {
+            const input = textarea.value; // 对当前框内内容进行处理（支持连续操作）
             try {
-                // 尝试删除原文并插入新文本
-                selectedRange.deleteContents();
-                selectedRange.insertNode(document.createTextNode(newText));
+                let res;
+                if (Tools[type]) {
+                    res = Tools[type](input);
+                }
+                textarea.value = res;
+                status.textContent = `${type} 成功`;
+                status.style.color = '#4caf50';
                 
-                // 清理选区，视觉反馈
-                window.getSelection().removeAllRanges();
-                statusMsg.textContent = "替换成功";
-                setTimeout(removeUI, 500); // 替换后0.5秒自动关闭面板
+                // 按钮高亮切换
+                shadow.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));
+                const targetBtn = shadow.querySelector(`button[data-type="${type}"]`);
+                if(targetBtn) targetBtn.classList.add('active');
+                
+            } catch (err) {
+                status.textContent = "解码失败";
+                status.style.color = '#f44336';
+                console.error(err);
+            }
+        };
+
+        // 绑定解码按钮
+        decoderGroup.onclick = (e) => {
+            const type = e.target.getAttribute('data-type');
+            if (type) doDecode(type);
+        };
+
+        // 美化按钮
+        shadow.getElementById('btn-fmt').onclick = () => {
+            const val = textarea.value;
+            textarea.value = Tools.beautify(val);
+            status.textContent = "已格式化";
+        };
+
+        // 复制按钮
+        shadow.getElementById('btn-copy').onclick = () => {
+            navigator.clipboard.writeText(textarea.value);
+            status.textContent = "已复制";
+        };
+
+        // 替换原文逻辑 (增强版)
+        shadow.getElementById('btn-replace').onclick = () => {
+            if (!selectedRange) return;
+            let newText = textarea.value;
+            
+            try {
+                // 检查上下文
+                const container = selectedRange.commonAncestorContainer;
+                const parentElement = container.nodeType === 1 ? container : container.parentElement;
+                const tagName = parentElement ? parentElement.tagName.toLowerCase() : '';
+
+                // 如果是输入框或textarea，直接赋值
+                if (tagName === 'textarea' || tagName === 'input') {
+                    // 尝试用 execCommand 保持撤销记录，如果不行则直接改 value
+                    if (!document.execCommand('insertText', false, newText)) {
+                        parentElement.value = newText;
+                    }
+                } 
+                // 如果是普通网页元素
+                else {
+                    // 检查是否在代码块 (<pre>, <code>) 中，如果是，保留 \n
+                    const isCodeBlock = parentElement.closest('pre') || parentElement.closest('code');
+                    
+                    if (!isCodeBlock && newText.includes('\n')) {
+                        // 如果不在代码块里，且有换行，转换为 <br>
+                        newText = newText.replace(/\n/g, '<br>');
+                        const tempDiv = document.createElement('div');
+                        tempDiv.innerHTML = newText;
+                        
+                        selectedRange.deleteContents();
+                        selectedRange.insertNode(tempDiv); // 插入带格式的片段
+                        
+                        // 移除外层的 div wrapper（如果只包含文本节点和br）
+                        // 简单处理：保留div wrapper防止破坏文档流，或者使用 DocumentFragment
+                    } else {
+                        // 纯文本替换
+                        selectedRange.deleteContents();
+                        selectedRange.insertNode(document.createTextNode(newText));
+                    }
+                }
+                
+                removeUI();
             } catch (e) {
-                statusMsg.textContent = "替换失败(区域受限)";
+                status.textContent = "替换受限";
                 console.error(e);
             }
         };
 
-        shadow.getElementById('btn-use-result').onclick = () => {
-             statusMsg.textContent = "Ready for next";
-             outputArea.focus();
-             outputArea.style.background = '#333';
-             setTimeout(()=> outputArea.style.background = '#1e1e1e', 100);
-        };
         shadow.getElementById('btn-close').onclick = removeUI;
     }
 
-    function escapeHtml(text) {
-        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    }
 })();
