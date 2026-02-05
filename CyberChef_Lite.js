@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CyberChef Pro
 // @namespace    http://tampermonkey.net/
-// @version      9.0
-// @description  智能多层解码工具 - 简洁模式，支持二次解码
+// @version      9.3
+// @description  智能多层解码工具 - 简洁模式，支持二次解码 (方案B+严格Base64检查)
 // @author       You
 // @match        *://*/*
 // @grant        GM_setClipboard
@@ -76,28 +76,62 @@
             return result;
         },
 
+        // ==================== 修复：自动修正 Base64 填充 ====================
         base64: function(str) {
             str = cleanPrefix(str);
-            const clean = str.replace(/\s/g, '');
-            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean) || clean.length < 4) {
-                throw new Error("非Base64格式");
-            }
+            const clean = str.replace(/[^A-Za-z0-9+/=]/g, '');
+
+            // 自动修正填充
+            let padded = clean;
+            const mod = clean.length % 4;
+            if (mod === 2) padded += '==';
+            else if (mod === 3) padded += '=';
+
+            if (padded.length < 4) throw new Error("非Base64格式");
+
             try {
-                const binary = atob(clean);
+                const binary = atob(padded);
                 const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
                 return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
             } catch (e) { throw new Error("Base64解码失败"); }
         },
 
+        // ==================== 修复：自动修正 Base64 填充 + UTF-16LE 解码 ====================
         psBase64: function(str) {
             str = cleanPrefix(str);
-            const clean = str.replace(/\s/g, '');
-            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) throw new Error("非Base64格式");
+            const clean = str.replace(/[^A-Za-z0-9+/=]/g, '');
+
+            // 自动修正填充
+            let padded = clean;
+            const mod = clean.length % 4;
+            if (mod === 2) padded += '==';
+            else if (mod === 3) padded += '=';
+            else if (mod === 1) {
+                throw new Error("Base64长度错误（模4余1），请检查选区是否包含多余字符或缺少字符");
+            }
+
+            if (padded.length < 4) throw new Error("非Base64格式");
+
             try {
-                const binary = atob(clean);
+                const binary = atob(padded);
                 const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-                return new TextDecoder('utf-16le').decode(bytes);
-            } catch (e) { throw new Error("PS-B64解码失败"); }
+
+                // 处理 UTF-16LE BOM
+                let offset = 0;
+                if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
+                    offset = 2;
+                }
+
+                // 确保偶数字节长度
+                let validBytes = bytes.slice(offset);
+                if (validBytes.length % 2 !== 0) {
+                    validBytes = validBytes.slice(0, -1);
+                }
+
+                return new TextDecoder('utf-16le', { fatal: false }).decode(validBytes);
+            } catch (e) {
+                throw new Error("PS-B64解码失败: " + e.message);
+            }
         },
 
         unicode: function(str) {
@@ -124,6 +158,7 @@
             catch (e) { return str.replace(/([{},])/g, '$1\n'); }
         },
 
+        // ==================== 修复：PS-Base64 与普通 Base64 智能识别 (方案B) ====================
         smart: function(str) {
             let result = cleanPrefix(str);
             let prev = '';
@@ -158,20 +193,75 @@
                     } catch (e) {}
                 }
 
-                const b64 = result.replace(/\s/g, '');
+                const b64 = result.replace(/[^A-Za-z0-9+/=]/g, '');
                 if (/^[A-Za-z0-9+/]+={0,2}$/.test(b64) && b64.length >= 8) {
-                    try {
-                        const d = Tools.base64(result);
-                        if (d && /[\x20-\x7e\u4e00-\u9fff]/.test(d)) {
-                            result = d; steps.push('Base64'); continue;
+                    // ==================== 方案B增强：严格的Base64有效性检查 ====================
+                    let normalResult = null;
+                    let psResult = null;
+
+                    try { normalResult = Tools.base64(result); } catch(e) {}
+                    try { psResult = Tools.psBase64(result); } catch(e) {}
+
+                    // 检查解码结果是否有意义（避免误解非Base64的内容如JS、HTML）
+                    function isValidDecode(s) {
+                        if (!s) return false;
+                        // 可打印ASCII + CJK汉字 + 常见符号/空白 占比 > 60%
+                        const validChars = (s.match(/[\x20-\x7e\u4e00-\u9fff\s\n\r\t(){}\[\]"':;,.<>\/\\`|@#$%^&*+=~_-]/g) || []).length;
+                        return validChars / s.length > 0.6;
+                    }
+
+                    const normalValid = normalResult && isValidDecode(normalResult);
+                    const psValid = psResult && isValidDecode(psResult);
+
+                    // 只有至少有一个有效解码结果时才继续
+                    if (normalValid || psValid) {
+                        // 计算控制字符比例（反向判断：过多控制字符表示解码失败）
+                        function controlRatio(s) {
+                            if (!s) return 1;
+                            const controlChars = (s.match(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g) || []).length;
+                            return controlChars / s.length;
                         }
-                    } catch (e) {}
-                    try {
-                        const d = Tools.psBase64(result);
-                        if (d && /[\x20-\x7e\u4e00-\u9fff]/.test(d)) {
-                            result = d; steps.push('PS-B64'); continue;
+
+                        // 统计null字符数
+                        const normalNullCount = normalResult ? (normalResult.match(/\x00/g) || []).length : Infinity;
+                        const psNullCount = psResult ? (psResult.match(/\x00/g) || []).length : Infinity;
+                        const normalCtrlRatio = normalResult ? controlRatio(normalResult) : 1;
+                        const psCtrlRatio = psResult ? controlRatio(psResult) : 1;
+
+                        // 选择策略：优先 null 字符少，其次控制字符少
+                        if (normalValid && psValid) {
+                            // 两个都有有效解码
+                            if (normalNullCount === 0 && psNullCount === 0) {
+                                // 都无 \x00，选控制字符少的
+                                result = psCtrlRatio < normalCtrlRatio ? psResult : normalResult;
+                                steps.push(psCtrlRatio < normalCtrlRatio ? 'PS-B64' : 'Base64');
+                                continue;
+                            } else if (normalNullCount === 0) {
+                                // 只有普通Base64无 \x00
+                                result = normalResult;
+                                steps.push('Base64');
+                                continue;
+                            } else if (psNullCount === 0) {
+                                // 只有PS-Base64无 \x00
+                                result = psResult;
+                                steps.push('PS-B64');
+                                continue;
+                            } else {
+                                // 都有 \x00，选数量少的
+                                if (psNullCount < normalNullCount) {
+                                    result = psResult; steps.push('PS-B64'); continue;
+                                } else {
+                                    result = normalResult; steps.push('Base64'); continue;
+                                }
+                            }
+                        } else if (psValid) {
+                            // 只有PS-Base64有效
+                            result = psResult; steps.push('PS-B64'); continue;
+                        } else if (normalValid) {
+                            // 只有普通Base64有效
+                            result = normalResult; steps.push('Base64'); continue;
                         }
-                    } catch (e) {}
+                    }
                 }
             }
 
@@ -303,7 +393,10 @@
             transition: border-color 0.2s;
         }
         .output:focus { border-color: #7aa2f7; }
-        .output::selection { background: #7aa2f7; color: #1a1b26; }
+        .output::selection {
+            background: #9ece6a !important;
+            color: #1a1b26 !important;
+        }
 
         .toolbar {
             display: flex;
@@ -397,6 +490,10 @@
     let isResizing = false;
     let dragOffsetX = 0, dragOffsetY = 0;
     let isCompactMode = CONFIG.defaultCompact;
+    let savedSelection = null;
+    let escListener = null;
+    let showingSource = false;
+    let originalText = '';
 
     // ==================== 事件监听 ====================
     document.addEventListener('mousedown', function(e) {
@@ -434,6 +531,7 @@
             if (triggerEl) { triggerEl.remove(); triggerEl = null; }
 
             selectedText = text;
+            originalText = text;
             selectedRange = sel.getRangeAt(0).cloneRange();
             showTrigger(e.clientX, e.clientY);
         }, 30);
@@ -455,6 +553,12 @@
     function removeUI() {
         if (triggerEl) { triggerEl.remove(); triggerEl = null; }
         if (panelEl) { panelEl.remove(); panelEl = null; }
+        if (escListener) {
+            document.removeEventListener('keydown', escListener);
+            escListener = null;
+        }
+        showingSource = false;
+        savedSelection = null;
     }
 
     function removeTrigger() {
@@ -506,22 +610,19 @@
                 </div>
                 <div class="right">
                     <span class="help" id="help-text">拖拽标题移动 | 右下角缩放</span>
+                    <button class="icon-btn" id="btn-source" title="查看原文">📄</button>
                     <button class="icon-btn" id="btn-mode" title="切换模式">☰</button>
                     <button class="icon-btn danger" id="btn-close" title="关闭 (ESC)">✕</button>
                 </div>
             </div>
             <div class="body">
                 <textarea class="output" id="output" spellcheck="false"></textarea>
-
-                <!-- 选中弹窗（仅简洁模式） -->
                 <div class="selection-popup" id="selection-popup">
                     <span>选中:</span>
                     <span class="text" id="selection-text"></span>
                     <button class="primary" id="btn-decode-selection">智能解码</button>
                     <button id="btn-cancel-selection">取消</button>
                 </div>
-
-                <!-- 简洁模式工具栏 -->
                 <div class="compact-bar" id="compact-bar">
                     <div class="actions">
                         <button data-tool="smart" class="primary">🔮 智能解码</button>
@@ -530,8 +631,6 @@
                     </div>
                     <span style="font-size:11px;color:#565f89;">选中部分可单独解码</span>
                 </div>
-
-                <!-- 完整模式工具栏 -->
                 <div class="toolbar" id="toolbar-decode" style="display:none;">
                     <span class="label">解码</span>
                     <button data-tool="smart" class="primary">🔮 智能</button>
@@ -550,10 +649,7 @@
                     <button id="btn-replace" class="primary">替换原文</button>
                 </div>
                 <div class="footer" id="footer" style="display:none;">
-                    <span>
-                        原文 ${selectedText.length} 字符
-                        ${hexLen > 0 ? ' | Hex ' + hexLen + ' ' + (isOdd ? '<span class="warn">⚠️奇数</span>' : '✓偶数') : ''}
-                    </span>
+                    <span>原文 ${selectedText.length} 字符${hexLen > 0 ? ' | Hex ' + hexLen + ' ' + (isOdd ? '<span class="warn">⚠️奇数</span>' : '✓偶数') : ''}</span>
                     <span>选中文本可手动解码</span>
                 </div>
             </div>
@@ -572,9 +668,7 @@
         const footerEl = shadow.getElementById('footer');
 
         outputEl.value = autoResult;
-        if (isDecoded) {
-            setStatus('✓ 已自动解码', 'ok');
-        }
+        if (isDecoded) setStatus('✓ 已自动解码', 'ok');
 
         function updateModeDisplay() {
             if (isCompactMode) {
@@ -591,7 +685,6 @@
                 toolbarAction.style.display = 'flex';
                 footerEl.style.display = 'flex';
                 helpText.textContent = '拖拽移动 | 右下角缩放';
-                // 完整模式下隐藏选中弹窗
                 selectionPopup.classList.remove('show');
             }
         }
@@ -608,9 +701,7 @@
 
         requestAnimationFrame(function() { panelEl.classList.add('show'); });
 
-        // ========== 事件绑定 ==========
-
-        // 拖拽
+        // ==================== 事件绑定 ====================
         shadow.getElementById('header').onmousedown = function(e) {
             if (e.target.tagName === 'BUTTON') return;
             isDragging = true;
@@ -620,17 +711,29 @@
             e.preventDefault();
         };
 
-        // 模式切换
+        const btnSource = shadow.getElementById('btn-source');
+        btnSource.onclick = function() {
+            showingSource = !showingSource;
+            if (showingSource) {
+                outputEl.value = originalText;
+                this.classList.add('active');
+                setStatus('显示原文', 'ok');
+            } else {
+                outputEl.value = autoResult;
+                this.classList.remove('active');
+                setStatus(isDecoded ? '✓ 已自动解码' : 'Ready', isDecoded ? 'ok' : '');
+            }
+        };
+
         shadow.getElementById('btn-mode').onclick = function() {
             isCompactMode = !isCompactMode;
             this.classList.toggle('active', !isCompactMode);
             updateModeDisplay();
         };
 
-        // 关闭
         shadow.getElementById('btn-close').onclick = removeUI;
 
-        // 工具按钮
+        // ==================== 工具按钮事件 ====================
         panelEl.querySelectorAll('[data-tool]').forEach(function(btn) {
             btn.onclick = function() {
                 const tool = btn.dataset.tool;
@@ -647,13 +750,17 @@
                         const after = outputEl.value.substring(end);
                         const decoded = Tools[tool](selected);
                         const cleanDecoded = cleanPrefix(decoded);
-                        
+
                         outputEl.value = before + cleanDecoded + after;
-                        
-                        // 高亮解码后的内容
-                        outputEl.focus();
-                        outputEl.setSelectionRange(start, start + cleanDecoded.length);
-                        
+
+                        // 双层requestAnimationFrame确保浏览器完成整个渲染周期
+                        requestAnimationFrame(function() {
+                            requestAnimationFrame(function() {
+                                outputEl.focus();
+                                outputEl.setSelectionRange(start, start + cleanDecoded.length);
+                            });
+                        });
+
                         setStatus('✓ 选中部分 ' + tool, 'ok');
                         selectionPopup.classList.remove('show');
                     } else {
@@ -671,8 +778,8 @@
 
         // textarea选中监听（仅简洁模式显示弹窗）
         outputEl.addEventListener('mouseup', function() {
-            if (!isCompactMode) return; // 完整模式不显示弹窗
-            
+            if (!isCompactMode) return;
+
             const start = outputEl.selectionStart;
             const end = outputEl.selectionEnd;
 
@@ -697,13 +804,17 @@
                 const after = outputEl.value.substring(end);
                 const decoded = Tools.smart(selected);
                 const cleanDecoded = cleanPrefix(decoded);
-                
+
                 outputEl.value = before + cleanDecoded + after;
-                
-                // 高亮解码后的内容
-                outputEl.focus();
-                outputEl.setSelectionRange(start, start + cleanDecoded.length);
-                
+
+                // 双层requestAnimationFrame确保浏览器完成整个渲染周期
+                requestAnimationFrame(function() {
+                    requestAnimationFrame(function() {
+                        outputEl.focus();
+                        outputEl.setSelectionRange(start, start + cleanDecoded.length);
+                    });
+                });
+
                 setStatus('✓ 选中部分已解码', 'ok');
                 selectionPopup.classList.remove('show');
             } catch (e) {
@@ -719,9 +830,16 @@
 
         // 复制
         function doCopy() {
-            const content = cleanPrefix(outputEl.value);
+            let content = cleanPrefix(outputEl.value);
+            content = content.replace(/\x00/g, '');
+
             navigator.clipboard.writeText(content).then(function() {
                 setStatus('✓ 已复制', 'ok');
+            }).catch(function() {
+                if (typeof GM_setClipboard !== 'undefined') {
+                    GM_setClipboard(content);
+                    setStatus('✓ 已复制 (GM)', 'ok');
+                }
             });
         }
         const copyBtn1 = shadow.getElementById('btn-copy');
@@ -729,7 +847,7 @@
         if (copyBtn1) copyBtn1.onclick = doCopy;
         if (copyBtn2) copyBtn2.onclick = doCopy;
 
-        // 替换原文（保留换行）
+        // 替换原文
         function doReplace() {
             if (!selectedRange) {
                 setStatus('✗ 无选区', 'err');
@@ -737,23 +855,27 @@
             }
             try {
                 let finalText = cleanPrefix(outputEl.value);
-                // 确保反转义
                 finalText = Tools.unescape(finalText);
+                finalText = finalText.replace(/\x00/g, '');
 
                 selectedRange.deleteContents();
 
-                // 查找最近的元素祖先
                 let container = selectedRange.commonAncestorContainer;
                 while (container && container.nodeType !== 1) {
                     container = container.parentNode;
                 }
 
-                // 检查是否是预格式化环境
                 let isPreformatted = false;
                 if (container) {
                     const nodeName = container.nodeName.toUpperCase();
-                    if (['PRE', 'CODE', 'TEXTAREA', 'INPUT'].includes(nodeName)) {
+                    if (['PRE', 'CODE', 'TEXTAREA'].includes(nodeName)) {
                         isPreformatted = true;
+                    } else if (nodeName === 'INPUT') {
+                        if (container.value !== undefined) {
+                            container.value = finalText;
+                            removeUI();
+                            return;
+                        }
                     } else {
                         try {
                             const style = window.getComputedStyle(container);
@@ -766,13 +888,11 @@
                 }
 
                 if (isPreformatted) {
-                    // 预格式化环境直接插入文本
                     selectedRange.insertNode(document.createTextNode(finalText));
                 } else {
-                    // 普通HTML：换行转<br>
                     const frag = document.createDocumentFragment();
                     const lines = finalText.split('\n');
-                    
+
                     for (let i = 0; i < lines.length; i++) {
                         if (lines[i]) {
                             frag.appendChild(document.createTextNode(lines[i]));
@@ -794,18 +914,17 @@
         if (replaceBtn1) replaceBtn1.onclick = doReplace;
         if (replaceBtn2) replaceBtn2.onclick = doReplace;
 
-        // ESC关闭
-        function onEscKey(e) {
+        // ESC关闭事件管理
+        escListener = function(e) {
             if (e.key === 'Escape') {
                 removeUI();
-                document.removeEventListener('keydown', onEscKey);
             }
-        }
-        document.addEventListener('keydown', onEscKey);
+        };
+        document.addEventListener('keydown', escListener);
 
         function setStatus(text, type) {
             statusEl.textContent = text;
-            statusEl.className = 'status ' + type;
+            statusEl.className = 'status ' + (type || '');
         }
     }
 
