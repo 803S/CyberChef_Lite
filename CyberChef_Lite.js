@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         CyberChef Pro
+// @name         sit_CyberChef Pro
 // @namespace    http://tampermonkey.net/
-// @version      9.3
-// @description  智能多层解码工具 - 简洁模式，支持二次解码 (方案B+严格Base64检查)
+// @version      10.0
+// @description  智能多层解码工具 - 优化版 (单层RAF + 改进解码逻辑 + 状态管理)
 // @author       You
 // @match        *://*/*
 // @grant        GM_setClipboard
@@ -29,6 +29,25 @@
     function clamp(val, min, max) {
         return Math.max(min, Math.min(max, val));
     }
+
+    // ==================== 状态管理 ====================
+    const AppState = {
+        selectedText: '',
+        selectedRange: null,
+        triggerEl: null,
+        panelEl: null,
+        isDragging: false,
+        isResizing: false,
+        dragOffsetX: 0,
+        dragOffsetY: 0,
+        isCompactMode: CONFIG.defaultCompact,
+        escListener: null,
+        showingSource: false,
+        originalText: '',
+        lastSelection: '',
+        mouseDownX: 0,
+        mouseDownY: 0,
+    };
 
     // ==================== 核心工具库 ====================
     const Tools = {
@@ -76,12 +95,10 @@
             return result;
         },
 
-        // ==================== 修复：自动修正 Base64 填充 ====================
         base64: function(str) {
             str = cleanPrefix(str);
             const clean = str.replace(/[^A-Za-z0-9+/=]/g, '');
 
-            // 自动修正填充
             let padded = clean;
             const mod = clean.length % 4;
             if (mod === 2) padded += '==';
@@ -96,12 +113,10 @@
             } catch (e) { throw new Error("Base64解码失败"); }
         },
 
-        // ==================== 修复：自动修正 Base64 填充 + UTF-16LE 解码 ====================
         psBase64: function(str) {
             str = cleanPrefix(str);
             const clean = str.replace(/[^A-Za-z0-9+/=]/g, '');
 
-            // 自动修正填充
             let padded = clean;
             const mod = clean.length % 4;
             if (mod === 2) padded += '==';
@@ -116,13 +131,11 @@
                 const binary = atob(padded);
                 const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
 
-                // 处理 UTF-16LE BOM
                 let offset = 0;
                 if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
                     offset = 2;
                 }
 
-                // 确保偶数字节长度
                 let validBytes = bytes.slice(offset);
                 if (validBytes.length % 2 !== 0) {
                     validBytes = validBytes.slice(0, -1);
@@ -158,113 +171,135 @@
             catch (e) { return str.replace(/([{},])/g, '$1\n'); }
         },
 
-        // ==================== 修复：PS-Base64 与普通 Base64 智能识别 (方案B) ====================
+        // ==================== 改进：更聪明的停止条件 ====================
         smart: function(str) {
             let result = cleanPrefix(str);
             let prev = '';
             const steps = [];
             let rounds = 15;
 
+            // 辅助函数：判断是否是有效解码结果
+            function isValidDecode(s) {
+                if (!s) return false;
+                const validChars = (s.match(/[\x20-\x7e\u4e00-\u9fff\s\n\r\t(){}\[\]"':;,.<>\/\\`|@#$%^&*+=~_-]/g) || []).length;
+                return validChars / s.length > 0.6;
+            }
+
+            // 辅助函数：判断结果是否可能是编码（避免过度解码）
+            function couldBeEncoded(s) {
+                // 检查是否含有足够的编码模式
+                const encodingPatterns = [
+                    /%[0-9A-Fa-f]{2}/,      // URL编码
+                    /\\u[0-9a-fA-F]{4}/,   // Unicode
+                    /^[A-Za-z0-9+/=]+$/,   // Base64
+                    /^[0-9a-fA-F]+$/,      // Hex
+                ];
+                const encodedCount = encodingPatterns.filter(p => p.test(s)).length;
+                return encodedCount > 0 && s.length > 10;
+            }
+
+            // 控制字符比例
+            function controlRatio(s) {
+                if (!s) return 1;
+                const controlChars = (s.match(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g) || []).length;
+                return controlChars / s.length;
+            }
+
             while (result !== prev && rounds-- > 0) {
                 prev = result;
+                let decoded = null;
+                let tool = null;
 
+                // 尝试Unicode解码
                 if (/\\u[0-9a-fA-F]{4}/.test(result)) {
                     try {
                         const d = Tools.unicode(result);
-                        if (d !== result) { result = d; steps.push('Unicode'); continue; }
+                        if (d !== result && isValidDecode(d)) { decoded = d; tool = 'Unicode'; }
                     } catch (e) {}
                 }
 
-                if (/%[0-9A-Fa-f]{2}/.test(result)) {
+                // 尝试URL解码
+                if (!decoded && /%[0-9A-Fa-f]{2}/.test(result)) {
                     try {
                         const d = Tools.url(result);
-                        if (d !== result) { result = d; steps.push('URL'); continue; }
+                        if (d !== result && isValidDecode(d)) { decoded = d; tool = 'URL'; }
                     } catch (e) {}
                 }
 
-                const hx = result.replace(/[\s\r\n]/g, '');
-                if (/^[0-9a-fA-F]+$/.test(hx) && hx.length >= 6) {
-                    try {
-                        const d = Tools.hex(result);
-                        const c = cleanPrefix(d);
-                        if (c && /[\x20-\x7e\u4e00-\u9fff]/.test(c)) {
-                            result = c; steps.push('Hex'); continue;
-                        }
-                    } catch (e) {}
-                }
-
-                const b64 = result.replace(/[^A-Za-z0-9+/=]/g, '');
-                if (/^[A-Za-z0-9+/]+={0,2}$/.test(b64) && b64.length >= 8) {
-                    // ==================== 方案B增强：严格的Base64有效性检查 ====================
-                    let normalResult = null;
-                    let psResult = null;
-
-                    try { normalResult = Tools.base64(result); } catch(e) {}
-                    try { psResult = Tools.psBase64(result); } catch(e) {}
-
-                    // 检查解码结果是否有意义（避免误解非Base64的内容如JS、HTML）
-                    function isValidDecode(s) {
-                        if (!s) return false;
-                        // 可打印ASCII + CJK汉字 + 常见符号/空白 占比 > 60%
-                        const validChars = (s.match(/[\x20-\x7e\u4e00-\u9fff\s\n\r\t(){}\[\]"':;,.<>\/\\`|@#$%^&*+=~_-]/g) || []).length;
-                        return validChars / s.length > 0.6;
-                    }
-
-                    const normalValid = normalResult && isValidDecode(normalResult);
-                    const psValid = psResult && isValidDecode(psResult);
-
-                    // 只有至少有一个有效解码结果时才继续
-                    if (normalValid || psValid) {
-                        // 计算控制字符比例（反向判断：过多控制字符表示解码失败）
-                        function controlRatio(s) {
-                            if (!s) return 1;
-                            const controlChars = (s.match(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g) || []).length;
-                            return controlChars / s.length;
-                        }
-
-                        // 统计null字符数
-                        const normalNullCount = normalResult ? (normalResult.match(/\x00/g) || []).length : Infinity;
-                        const psNullCount = psResult ? (psResult.match(/\x00/g) || []).length : Infinity;
-                        const normalCtrlRatio = normalResult ? controlRatio(normalResult) : 1;
-                        const psCtrlRatio = psResult ? controlRatio(psResult) : 1;
-
-                        // 选择策略：优先 null 字符少，其次控制字符少
-                        if (normalValid && psValid) {
-                            // 两个都有有效解码
-                            if (normalNullCount === 0 && psNullCount === 0) {
-                                // 都无 \x00，选控制字符少的
-                                result = psCtrlRatio < normalCtrlRatio ? psResult : normalResult;
-                                steps.push(psCtrlRatio < normalCtrlRatio ? 'PS-B64' : 'Base64');
-                                continue;
-                            } else if (normalNullCount === 0) {
-                                // 只有普通Base64无 \x00
-                                result = normalResult;
-                                steps.push('Base64');
-                                continue;
-                            } else if (psNullCount === 0) {
-                                // 只有PS-Base64无 \x00
-                                result = psResult;
-                                steps.push('PS-B64');
-                                continue;
-                            } else {
-                                // 都有 \x00，选数量少的
-                                if (psNullCount < normalNullCount) {
-                                    result = psResult; steps.push('PS-B64'); continue;
-                                } else {
-                                    result = normalResult; steps.push('Base64'); continue;
-                                }
+                // 尝试Hex解码
+                if (!decoded) {
+                    const hx = result.replace(/[\s\r\n]/g, '');
+                    if (/^[0-9a-fA-F]+$/.test(hx) && hx.length >= 6) {
+                        try {
+                            const d = Tools.hex(result);
+                            const c = cleanPrefix(d);
+                            if (c && /[\x20-\x7e\u4e00-\u9fff]/.test(c)) {
+                                decoded = c; tool = 'Hex';
                             }
-                        } else if (psValid) {
-                            // 只有PS-Base64有效
-                            result = psResult; steps.push('PS-B64'); continue;
-                        } else if (normalValid) {
-                            // 只有普通Base64有效
-                            result = normalResult; steps.push('Base64'); continue;
+                        } catch (e) {}
+                    }
+                }
+
+                // 尝试Base64解码（增强的智能选择）
+                if (!decoded) {
+                    const b64 = result.replace(/[^A-Za-z0-9+/=]/g, '');
+                    if (/^[A-Za-z0-9+/]+={0,2}$/.test(b64) && b64.length >= 8) {
+                        let normalResult = null;
+                        let psResult = null;
+
+                        try { normalResult = Tools.base64(result); } catch(e) {}
+                        try { psResult = Tools.psBase64(result); } catch(e) {}
+
+                        const normalValid = normalResult && isValidDecode(normalResult);
+                        const psValid = psResult && isValidDecode(psResult);
+
+                        if (normalValid || psValid) {
+                            const normalNullCount = normalResult ? (normalResult.match(/\x00/g) || []).length : Infinity;
+                            const psNullCount = psResult ? (psResult.match(/\x00/g) || []).length : Infinity;
+                            const normalCtrlRatio = normalResult ? controlRatio(normalResult) : 1;
+                            const psCtrlRatio = psResult ? controlRatio(psResult) : 1;
+
+                            if (normalValid && psValid) {
+                                if (normalNullCount === 0 && psNullCount === 0) {
+                                    decoded = psCtrlRatio < normalCtrlRatio ? psResult : normalResult;
+                                    tool = psCtrlRatio < normalCtrlRatio ? 'PS-B64' : 'Base64';
+                                } else if (normalNullCount === 0) {
+                                    decoded = normalResult;
+                                    tool = 'Base64';
+                                } else if (psNullCount === 0) {
+                                    decoded = psResult;
+                                    tool = 'PS-B64';
+                                } else {
+                                    decoded = psNullCount < normalNullCount ? psResult : normalResult;
+                                    tool = psNullCount < normalNullCount ? 'PS-B64' : 'Base64';
+                                }
+                            } else if (psValid) {
+                                decoded = psResult;
+                                tool = 'PS-B64';
+                            } else if (normalValid) {
+                                decoded = normalResult;
+                                tool = 'Base64';
+                            }
                         }
                     }
+                }
+
+                // 应用解码结果，但检查停止条件
+                if (decoded && decoded !== result) {
+                    // 新增：如果解码后的文本已经足够清晰且不太可能进一步编码，则停止
+                    if (isValidDecode(decoded) && !couldBeEncoded(decoded)) {
+                        result = decoded;
+                        steps.push(tool);
+                        break;  // 提前停止，避免过度解码
+                    }
+                    result = decoded;
+                    steps.push(tool);
+                } else {
+                    break;  // 无法继续解码
                 }
             }
 
+            // 处理反转义
             if (/\\[ntr"']/.test(result)) {
                 result = Tools.unescape(result);
                 steps.push('反转义');
@@ -277,6 +312,23 @@
         }
     };
 
+    // ==================== 优化：统一处理textarea更新 ====================
+    function updateTextareaBatch(textarea, newValue, startPos, endPos, preserveScroll = true) {
+        const savedScroll = preserveScroll ? textarea.scrollTop : undefined;
+
+        textarea.value = newValue;
+        textarea.setSelectionRange(startPos, endPos);
+
+        if (preserveScroll !== undefined) {
+            // 单次RAF即可，避免三层嵌套
+            requestAnimationFrame(function() {
+                textarea.scrollTop = savedScroll;
+            });
+        }
+
+        textarea.focus();
+    }
+
     // ==================== UI构建 ====================
     const host = document.createElement('div');
     host.id = 'cyberchef-pro-host';
@@ -286,38 +338,86 @@
 
     const style = document.createElement('style');
     style.textContent = `
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :host {
+            --color-base-00: rgba(255, 255, 255, 0.85);
+            --color-base-01: rgba(248, 250, 255, 0.9);
+            --color-base-02: rgba(235, 242, 255, 0.8);
+            --color-base-03: rgba(220, 230, 255, 0.7);
+            --color-base-04: rgba(180, 200, 230, 0.6);
+            --color-base-05: rgba(100, 120, 160, 0.8);
+            --color-base-06: rgba(40, 70, 130, 0.95);
+            --color-base-07: rgba(20, 40, 90, 1);
+
+            --color-success: #10b981;
+            --color-warning: #f59e0b;
+            --color-error: #ef4444;
+            --color-info: #3b82f6;
+            --color-accent: #60a5fa;
+
+            --radius-sm: 4px;
+            --radius: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+
+            --space-1: 4px;
+            --space-2: 8px;
+            --space-3: 12px;
+            --space-4: 16px;
+
+            --shadow-sm: 0 1px 3px rgba(59, 130, 246, 0.1);
+            --shadow-md: 0 4px 12px rgba(59, 130, 246, 0.15);
+            --shadow-lg: 0 12px 32px rgba(59, 130, 246, 0.2);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
 
         .trigger {
             pointer-events: auto;
             position: fixed;
-            width: 44px; height: 44px;
-            background: linear-gradient(135deg, #667eea, #764ba2);
+            width: 44px;
+            height: 44px;
+            background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+            border: none;
             border-radius: 50%;
-            color: #fff;
-            display: flex; align-items: center; justify-content: center;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            font-weight: 600;
             cursor: pointer;
-            box-shadow: 0 4px 20px rgba(102,126,234,0.5);
-            font-size: 22px;
-            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 8px 24px rgba(59, 130, 246, 0.35), inset 0 1px 0 rgba(255,255,255,0.3);
             z-index: 99999;
             user-select: none;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(4px);
         }
+
         .trigger:hover {
             transform: scale(1.15);
-            box-shadow: 0 6px 30px rgba(102,126,234,0.7);
+            box-shadow: 0 12px 32px rgba(59, 130, 246, 0.45), inset 0 1px 0 rgba(255,255,255,0.3);
+        }
+
+        .trigger:active {
+            transform: scale(0.94);
         }
 
         .panel {
             pointer-events: auto;
             position: fixed;
-            background: #1a1b26;
-            color: #a9b1d6;
-            border: 1px solid #414868;
-            border-radius: 12px;
-            box-shadow: 0 25px 80px rgba(0,0,0,0.7);
+            background: linear-gradient(135deg, rgba(240, 245, 255, 0.9) 0%, rgba(220, 235, 255, 0.85) 100%);
+            color: var(--color-base-06);
+            border: 1px solid rgba(180, 200, 230, 0.4);
+            border-radius: var(--radius-lg);
+            box-shadow: 0 8px 32px rgba(59, 130, 246, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+            backdrop-filter: blur(12px);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            display: flex; flex-direction: column;
+            display: flex;
+            flex-direction: column;
             opacity: 0;
             transition: opacity 0.2s;
             overflow: hidden;
@@ -327,50 +427,118 @@
         .panel.full { width: 620px; height: 480px; min-width: 500px; min-height: 380px; resize: both; }
 
         .header {
-            background: linear-gradient(90deg, #1a1b26, #24283b);
-            padding: 10px 14px;
+            background: linear-gradient(90deg, rgba(230, 240, 255, 0.8) 0%, rgba(210, 230, 255, 0.7) 100%);
+            padding: 12px 14px;
             cursor: move;
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid #414868;
-            border-radius: 12px 12px 0 0;
+            gap: 12px;
+            border-bottom: 1px solid rgba(180, 200, 230, 0.3);
             flex-shrink: 0;
             user-select: none;
-            gap: 10px;
+            backdrop-filter: blur(8px);
         }
-        .header .left { display: flex; align-items: center; gap: 10px; }
-        .header .title { font-weight: 600; font-size: 14px; color: #7aa2f7; }
+        .header:dblclick {
+            cursor: pointer;
+        }
+        .header .left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+            min-width: 0;
+        }
+        .header .title {
+            font-weight: 600;
+            font-size: 14px;
+            background: linear-gradient(90deg, #3b82f6 0%, #6366f1 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: 0.3px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
         .header .status {
-            font-size: 11px; padding: 3px 8px; border-radius: 4px;
-            background: #414868; white-space: nowrap;
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: var(--radius);
+            background: transparent;
+            color: rgba(40, 70, 130, 0.9);
+            font-weight: 500;
+            flex: 1;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
-        .header .status.ok { background: #9ece6a; color: #1a1b26; }
-        .header .status.err { background: #f7768e; color: #1a1b26; }
-        .header .right { display: flex; align-items: center; gap: 6px; }
+        .header .status.ok {
+            background: transparent;
+            color: var(--color-success);
+        }
+        .header .status.err {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--color-error);
+        }
+        .header .right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+            margin-left: auto;
+        }
         .header .help {
-            font-size: 10px; color: #565f89; max-width: 200px;
-            line-height: 1.3; text-align: right;
+            font-size: 10px;
+            color: var(--color-base-05);
+            line-height: 1.4;
+            text-align: left;
+            flex: 0 1 auto;
+            min-width: 50px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .icon-btn {
-            width: 28px; height: 28px;
-            background: #24283b; border: 1px solid #414868;
-            border-radius: 6px; color: #a9b1d6;
-            cursor: pointer; font-size: 14px;
-            display: flex; align-items: center; justify-content: center;
+            width: 32px;
+            height: 32px;
+            background: rgba(220, 235, 255, 0.5);
+            border: 1px solid rgba(180, 200, 230, 0.4);
+            border-radius: var(--radius);
+            color: var(--color-base-05);
+            cursor: pointer;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             transition: all 0.15s;
+            flex-shrink: 0;
+            backdrop-filter: blur(4px);
         }
-        .icon-btn:hover { background: #414868; color: #fff; }
-        .icon-btn.danger:hover { background: #f7768e; color: #1a1b26; }
-        .icon-btn.active { background: #7aa2f7; color: #1a1b26; }
+        .icon-btn:hover {
+            background: rgba(200, 220, 255, 0.7);
+            border-color: rgba(59, 130, 246, 0.4);
+            color: var(--color-base-06);
+        }
+        .icon-btn:active { transform: scale(0.95); }
+        .icon-btn.danger:hover {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: var(--color-error);
+            color: var(--color-error);
+        }
+        .icon-btn.active {
+            background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+            border-color: #3b82f6;
+            color: #ffffff;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
 
         .body {
             flex: 1;
-            padding: 12px;
+            padding: 14px;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 12px;
             overflow: hidden;
             position: relative;
         }
@@ -378,24 +546,32 @@
         .output {
             flex: 1;
             width: 100%;
-            background: #13141c;
-            color: #c0caf5;
-            border: 2px solid #414868;
+            background: rgba(248, 250, 255, 0.7);
+            color: var(--color-base-06);
+            border: 1px solid rgba(180, 200, 230, 0.4);
             padding: 12px;
             resize: none;
-            font-size: 13px;
-            font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+            font-size: 12px;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
             line-height: 1.6;
             outline: none;
             white-space: pre-wrap;
             word-break: break-all;
-            border-radius: 8px;
-            transition: border-color 0.2s;
+            border-radius: var(--radius-md);
+            transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+            box-shadow: inset 0 1px 3px rgba(59, 130, 246, 0.08);
+            backdrop-filter: blur(4px);
+            overflow-y: auto;
+            overflow-x: hidden;
         }
-        .output:focus { border-color: #7aa2f7; }
+        .output:focus {
+            border-color: rgba(59, 130, 246, 0.6);
+            background: rgba(255, 255, 255, 0.9);
+            box-shadow: inset 0 1px 3px rgba(59, 130, 246, 0.08), 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
         .output::selection {
             background: #9ece6a !important;
-            color: #1a1b26 !important;
+            color: var(--color-base-06) !important;
         }
 
         .toolbar {
@@ -407,67 +583,104 @@
         }
         .toolbar .label {
             font-size: 11px;
-            color: #565f89;
+            color: var(--color-base-05);
             font-weight: 500;
+            letter-spacing: 0.3px;
         }
 
         button {
-            background: #24283b;
-            color: #a9b1d6;
-            border: 1px solid #414868;
+            background: rgba(220, 235, 255, 0.5);
+            color: var(--color-base-06);
+            border: 1px solid rgba(180, 200, 230, 0.4);
             padding: 6px 12px;
             cursor: pointer;
-            border-radius: 6px;
+            border-radius: var(--radius);
             font-size: 12px;
             font-weight: 500;
-            transition: all 0.15s;
+            transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
             white-space: nowrap;
+            outline: none;
+            backdrop-filter: blur(2px);
         }
-        button:hover { background: #414868; color: #c0caf5; }
-        button.active { background: #7aa2f7; color: #1a1b26; border-color: #7aa2f7; }
-        button.primary { background: #7aa2f7; color: #1a1b26; border-color: #7aa2f7; }
-        button.primary:hover { background: #89b4fa; }
-        button.warn { background: #e0af68; color: #1a1b26; }
-        button.warn:hover { background: #f0c078; }
+        button:hover:not(:disabled) {
+            background: rgba(200, 220, 255, 0.7);
+            border-color: rgba(59, 130, 246, 0.4);
+            color: var(--color-info);
+        }
+        button:active:not(:disabled) { transform: scale(0.96); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-        .sep { width: 1px; height: 24px; background: #414868; }
+        button.active {
+            background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+            color: #ffffff;
+            border-color: #3b82f6;
+        }
+        button.primary {
+            background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+            color: #ffffff;
+            border-color: #3b82f6;
+        }
+        button.primary:hover:not(:disabled) {
+            background: linear-gradient(135deg, #2563eb 0%, #4f46e5 100%);
+            border-color: #2563eb;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
+        button.warn {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--color-warning);
+            border-color: var(--color-warning);
+        }
+        button.warn:hover:not(:disabled) {
+            background: rgba(245, 158, 11, 0.15);
+        }
+
+        .sep { width: 1px; height: 24px; background: var(--color-base-03); }
 
         .footer {
             display: flex;
             justify-content: space-between;
             align-items: center;
             font-size: 11px;
-            color: #565f89;
+            color: var(--color-base-05);
             flex-shrink: 0;
-            padding-top: 8px;
-            border-top: 1px solid #24283b;
+            padding-top: 10px;
+            border-top: 1px solid var(--color-base-02);
         }
-        .footer .warn { color: #e0af68; }
+        .footer .warn { color: var(--color-warning); }
 
         .compact-bar {
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-shrink: 0;
+            gap: 12px;
         }
-        .compact-bar .actions { display: flex; gap: 8px; }
+        .compact-bar .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
         .selection-popup {
             position: absolute;
             bottom: 70px;
             left: 50%;
             transform: translateX(-50%);
-            background: #414868;
-            color: #c0caf5;
-            padding: 10px 16px;
-            border-radius: 8px;
+            background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+            color: #ffffff;
+            padding: 12px 16px;
+            border-radius: var(--radius-md);
+            border: 1px solid rgba(255,255,255,0.2);
             font-size: 12px;
             display: none;
             align-items: center;
             gap: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            box-shadow: 0 8px 24px rgba(59, 130, 246, 0.35), inset 0 1px 0 rgba(255,255,255,0.3);
             z-index: 100;
             max-width: 90%;
+            font-weight: 500;
+            animation: slideDown 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+            backdrop-filter: blur(8px);
+        }
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+            to { opacity: 1; transform: translateX(-50%) translateY(0); }
         }
         .selection-popup.show { display: flex; }
         .selection-popup .text {
@@ -475,51 +688,46 @@
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            color: #9ece6a;
-            font-family: monospace;
+            color: #ffffff;
+            font-family: 'SF Mono', monospace;
+            font-size: 11px;
+            font-weight: 400;
+            background: rgba(255,255,255,0.2);
+            padding: 4px 10px;
+            border-radius: 4px;
         }
     `;
     shadow.appendChild(style);
 
-    // ==================== 状态变量 ====================
-    let selectedText = '';
-    let selectedRange = null;
-    let triggerEl = null;
-    let panelEl = null;
-    let isDragging = false;
-    let isResizing = false;
-    let dragOffsetX = 0, dragOffsetY = 0;
-    let isCompactMode = CONFIG.defaultCompact;
-    let savedSelection = null;
-    let escListener = null;
-    let showingSource = false;
-    let originalText = '';
-
     // ==================== 事件监听 ====================
     document.addEventListener('mousedown', function(e) {
-        if (triggerEl && !host.contains(e.target)) {
+        AppState.mouseDownX = e.clientX;
+        AppState.mouseDownY = e.clientY;
+        AppState.lastSelection = window.getSelection().toString();
+
+        if (AppState.triggerEl && !host.contains(e.target)) {
             setTimeout(function() {
                 const sel = window.getSelection();
                 if (!sel || sel.toString().trim() === '') {
-                    if (triggerEl) { triggerEl.remove(); triggerEl = null; }
+                    if (AppState.triggerEl) { AppState.triggerEl.remove(); AppState.triggerEl = null; }
                 }
             }, 100);
         }
     });
 
     document.addEventListener('mouseup', function(e) {
-        if (panelEl) {
-            const rect = panelEl.getBoundingClientRect();
+        if (AppState.panelEl) {
+            const rect = AppState.panelEl.getBoundingClientRect();
             const isNearEdge = (e.clientX > rect.right - 20 && e.clientY > rect.bottom - 20);
             if (isNearEdge) {
-                isResizing = true;
+                AppState.isResizing = true;
                 return;
             }
         }
 
-        if (isDragging) { isDragging = false; return; }
-        if (isResizing) { isResizing = false; return; }
-        if (panelEl && host.contains(e.target)) return;
+        if (AppState.isDragging) { AppState.isDragging = false; return; }
+        if (AppState.isResizing) { AppState.isResizing = false; return; }
+        if (AppState.panelEl && host.contains(e.target)) return;
 
         setTimeout(function() {
             const sel = window.getSelection();
@@ -528,41 +736,43 @@
             const text = sel.toString().trim();
             if (!text) return;
 
-            if (triggerEl) { triggerEl.remove(); triggerEl = null; }
+            if (text === AppState.lastSelection.trim()) return;
 
-            selectedText = text;
-            originalText = text;
-            selectedRange = sel.getRangeAt(0).cloneRange();
+            if (AppState.triggerEl) { AppState.triggerEl.remove(); AppState.triggerEl = null; }
+
+            AppState.selectedText = text;
+            AppState.originalText = text;
+            AppState.selectedRange = sel.getRangeAt(0).cloneRange();
             showTrigger(e.clientX, e.clientY);
         }, 30);
     });
 
     document.addEventListener('mousemove', function(e) {
-        if (isDragging && panelEl) {
-            let newX = e.clientX - dragOffsetX;
-            let newY = e.clientY - dragOffsetY;
-            const rect = panelEl.getBoundingClientRect();
+        if (AppState.isDragging && AppState.panelEl) {
+            let newX = e.clientX - AppState.dragOffsetX;
+            let newY = e.clientY - AppState.dragOffsetY;
+            const rect = AppState.panelEl.getBoundingClientRect();
             newX = clamp(newX, 0, window.innerWidth - rect.width);
             newY = clamp(newY, 0, window.innerHeight - rect.height);
-            panelEl.style.left = newX + 'px';
-            panelEl.style.top = newY + 'px';
+            AppState.panelEl.style.left = newX + 'px';
+            AppState.panelEl.style.top = newY + 'px';
         }
     });
 
     // ==================== UI函数 ====================
     function removeUI() {
-        if (triggerEl) { triggerEl.remove(); triggerEl = null; }
-        if (panelEl) { panelEl.remove(); panelEl = null; }
-        if (escListener) {
-            document.removeEventListener('keydown', escListener);
-            escListener = null;
+        if (AppState.triggerEl) { AppState.triggerEl.remove(); AppState.triggerEl = null; }
+        if (AppState.panelEl) { AppState.panelEl.remove(); AppState.panelEl = null; }
+        if (AppState.escListener) {
+            document.removeEventListener('keydown', AppState.escListener);
+            AppState.escListener = null;
         }
-        showingSource = false;
-        savedSelection = null;
+        AppState.showingSource = false;
+        AppState.selectedRange = null;
     }
 
     function removeTrigger() {
-        if (triggerEl) { triggerEl.remove(); triggerEl = null; }
+        if (AppState.triggerEl) { AppState.triggerEl.remove(); AppState.triggerEl = null; }
     }
 
     function showTrigger(x, y) {
@@ -572,44 +782,44 @@
         finalX = clamp(finalX, 10, window.innerWidth - btnSize - 10);
         finalY = clamp(finalY, 10, window.innerHeight - btnSize - 10);
 
-        triggerEl = document.createElement('div');
-        triggerEl.className = 'trigger';
-        triggerEl.textContent = '⚡';
-        triggerEl.style.left = finalX + 'px';
-        triggerEl.style.top = finalY + 'px';
+        AppState.triggerEl = document.createElement('div');
+        AppState.triggerEl.className = 'trigger';
+        AppState.triggerEl.textContent = '⚡';
+        AppState.triggerEl.style.left = finalX + 'px';
+        AppState.triggerEl.style.top = finalY + 'px';
 
-        triggerEl.onclick = function(e) {
+        AppState.triggerEl.onclick = function(e) {
             e.stopPropagation();
             const cx = e.clientX, cy = e.clientY;
             removeTrigger();
             showPanel(cx, cy);
         };
 
-        shadow.appendChild(triggerEl);
+        shadow.appendChild(AppState.triggerEl);
     }
 
     function showPanel(mx, my) {
-        if (panelEl) { panelEl.remove(); panelEl = null; }
+        if (AppState.panelEl) { AppState.panelEl.remove(); AppState.panelEl = null; }
 
-        panelEl = document.createElement('div');
-        panelEl.className = 'panel ' + (isCompactMode ? 'compact' : 'full');
+        AppState.panelEl = document.createElement('div');
+        AppState.panelEl.className = 'panel ' + (AppState.isCompactMode ? 'compact' : 'full');
 
         let autoResult;
-        try { autoResult = Tools.smart(selectedText); }
-        catch (e) { autoResult = selectedText; }
+        try { autoResult = Tools.smart(AppState.selectedText); }
+        catch (e) { autoResult = AppState.selectedText; }
 
-        const isDecoded = autoResult !== selectedText;
-        const hexLen = selectedText.replace(/[^0-9a-fA-F]/g, '').length;
+        const isDecoded = autoResult !== AppState.selectedText;
+        const hexLen = AppState.selectedText.replace(/[^0-9a-fA-F]/g, '').length;
         const isOdd = hexLen % 2 !== 0;
 
-        panelEl.innerHTML = `
+        AppState.panelEl.innerHTML = `
             <div class="header" id="header">
                 <div class="left">
                     <span class="title">🔧 CyberChef</span>
                     <span class="status" id="status">Ready</span>
                 </div>
                 <div class="right">
-                    <span class="help" id="help-text">拖拽标题移动 | 右下角缩放</span>
+                    <span class="help" id="help-text">拖拽标题移动 | 右下角缩放 | 双击关闭</span>
                     <button class="icon-btn" id="btn-source" title="查看原文">📄</button>
                     <button class="icon-btn" id="btn-mode" title="切换模式">☰</button>
                     <button class="icon-btn danger" id="btn-close" title="关闭 (ESC)">✕</button>
@@ -618,10 +828,10 @@
             <div class="body">
                 <textarea class="output" id="output" spellcheck="false"></textarea>
                 <div class="selection-popup" id="selection-popup">
-                    <span>选中:</span>
+                    <span style="font-size: 11px; color: #ffffff; font-weight: 500;">选中:</span>
                     <span class="text" id="selection-text"></span>
-                    <button class="primary" id="btn-decode-selection">智能解码</button>
-                    <button id="btn-cancel-selection">取消</button>
+                    <button id="btn-decode-selection" style="padding: 4px 12px; font-size: 11px; background: rgba(255,255,255,0.25); color: #ffffff; border: 1px solid rgba(255,255,255,0.4); font-weight: 500;">🔮 解码</button>
+                    <button id="btn-cancel-selection" style="padding: 4px 12px; font-size: 11px; background: transparent; color: #ffffff; border: 1px solid rgba(255,255,255,0.4); font-weight: 500;">取消</button>
                 </div>
                 <div class="compact-bar" id="compact-bar">
                     <div class="actions">
@@ -629,7 +839,7 @@
                         <button id="btn-copy-c">📋 复制</button>
                         <button id="btn-replace-c" class="primary">替换原文</button>
                     </div>
-                    <span style="font-size:11px;color:#565f89;">选中部分可单独解码</span>
+                    <span style="font-size: 11px; color: var(--color-base-05);">选中部分可单独解码</span>
                 </div>
                 <div class="toolbar" id="toolbar-decode" style="display:none;">
                     <span class="label">解码</span>
@@ -649,13 +859,13 @@
                     <button id="btn-replace" class="primary">替换原文</button>
                 </div>
                 <div class="footer" id="footer" style="display:none;">
-                    <span>原文 ${selectedText.length} 字符${hexLen > 0 ? ' | Hex ' + hexLen + ' ' + (isOdd ? '<span class="warn">⚠️奇数</span>' : '✓偶数') : ''}</span>
+                    <span>原文 ${AppState.selectedText.length} 字符${hexLen > 0 ? ' | Hex ' + hexLen + ' ' + (isOdd ? '<span class="warn">⚠️奇数</span>' : '✓偶数') : ''}</span>
                     <span>选中文本可手动解码</span>
                 </div>
             </div>
         `;
 
-        shadow.appendChild(panelEl);
+        shadow.appendChild(AppState.panelEl);
 
         const outputEl = shadow.getElementById('output');
         const statusEl = shadow.getElementById('status');
@@ -671,15 +881,15 @@
         if (isDecoded) setStatus('✓ 已自动解码', 'ok');
 
         function updateModeDisplay() {
-            if (isCompactMode) {
-                panelEl.className = 'panel compact show';
+            if (AppState.isCompactMode) {
+                AppState.panelEl.className = 'panel compact show';
                 compactBar.style.display = 'flex';
                 toolbarDecode.style.display = 'none';
                 toolbarAction.style.display = 'none';
                 footerEl.style.display = 'none';
                 helpText.textContent = '拖拽标题移动 | 右下角缩放';
             } else {
-                panelEl.className = 'panel full show';
+                AppState.panelEl.className = 'panel full show';
                 compactBar.style.display = 'none';
                 toolbarDecode.style.display = 'flex';
                 toolbarAction.style.display = 'flex';
@@ -692,30 +902,35 @@
 
         let px = mx + CONFIG.panelOffsetX;
         let py = my + CONFIG.panelOffsetY;
-        const panelW = isCompactMode ? 520 : 620;
-        const panelH = isCompactMode ? 320 : 480;
+        const panelW = AppState.isCompactMode ? 520 : 620;
+        const panelH = AppState.isCompactMode ? 320 : 480;
         px = clamp(px, 10, window.innerWidth - panelW - 10);
         py = clamp(py, 10, window.innerHeight - panelH - 10);
-        panelEl.style.left = px + 'px';
-        panelEl.style.top = py + 'px';
+        AppState.panelEl.style.left = px + 'px';
+        AppState.panelEl.style.top = py + 'px';
 
-        requestAnimationFrame(function() { panelEl.classList.add('show'); });
+        requestAnimationFrame(function() { AppState.panelEl.classList.add('show'); });
 
         // ==================== 事件绑定 ====================
         shadow.getElementById('header').onmousedown = function(e) {
             if (e.target.tagName === 'BUTTON') return;
-            isDragging = true;
-            const rect = panelEl.getBoundingClientRect();
-            dragOffsetX = e.clientX - rect.left;
-            dragOffsetY = e.clientY - rect.top;
+            AppState.isDragging = true;
+            const rect = AppState.panelEl.getBoundingClientRect();
+            AppState.dragOffsetX = e.clientX - rect.left;
+            AppState.dragOffsetY = e.clientY - rect.top;
             e.preventDefault();
+        };
+
+        shadow.getElementById('header').ondblclick = function(e) {
+            if (e.target.tagName === 'BUTTON') return;
+            removeUI();
         };
 
         const btnSource = shadow.getElementById('btn-source');
         btnSource.onclick = function() {
-            showingSource = !showingSource;
-            if (showingSource) {
-                outputEl.value = originalText;
+            AppState.showingSource = !AppState.showingSource;
+            if (AppState.showingSource) {
+                outputEl.value = AppState.originalText;
                 this.classList.add('active');
                 setStatus('显示原文', 'ok');
             } else {
@@ -726,15 +941,15 @@
         };
 
         shadow.getElementById('btn-mode').onclick = function() {
-            isCompactMode = !isCompactMode;
-            this.classList.toggle('active', !isCompactMode);
+            AppState.isCompactMode = !AppState.isCompactMode;
+            this.classList.toggle('active', !AppState.isCompactMode);
             updateModeDisplay();
         };
 
         shadow.getElementById('btn-close').onclick = removeUI;
 
         // ==================== 工具按钮事件 ====================
-        panelEl.querySelectorAll('[data-tool]').forEach(function(btn) {
+        AppState.panelEl.querySelectorAll('[data-tool]').forEach(function(btn) {
             btn.onclick = function() {
                 const tool = btn.dataset.tool;
                 if (!Tools[tool]) return;
@@ -744,31 +959,24 @@
                     const end = outputEl.selectionEnd;
 
                     if (start !== end) {
-                        // 解码选中部分并替换
+                        // 使用优化后的updateTextareaBatch处理部分解码
                         const before = outputEl.value.substring(0, start);
                         const selected = outputEl.value.substring(start, end);
                         const after = outputEl.value.substring(end);
                         const decoded = Tools[tool](selected);
                         const cleanDecoded = cleanPrefix(decoded);
 
-                        outputEl.value = before + cleanDecoded + after;
-
-                        // 双层requestAnimationFrame确保浏览器完成整个渲染周期
-                        requestAnimationFrame(function() {
-                            requestAnimationFrame(function() {
-                                outputEl.focus();
-                                outputEl.setSelectionRange(start, start + cleanDecoded.length);
-                            });
-                        });
-
+                        updateTextareaBatch(outputEl, before + cleanDecoded + after, start, start + cleanDecoded.length);
                         setStatus('✓ 选中部分 ' + tool, 'ok');
                         selectionPopup.classList.remove('show');
                     } else {
-                        outputEl.value = Tools[tool](outputEl.value);
+                        // 完整解码
+                        const newValue = Tools[tool](outputEl.value);
+                        updateTextareaBatch(outputEl, newValue, 0, newValue.length);
                         setStatus('✓ ' + tool, 'ok');
                     }
 
-                    panelEl.querySelectorAll('[data-tool]').forEach(b => b.classList.remove('active'));
+                    AppState.panelEl.querySelectorAll('[data-tool]').forEach(b => b.classList.remove('active'));
                     btn.classList.add('active');
                 } catch (err) {
                     setStatus('✗ ' + (err.message || '失败'), 'err');
@@ -776,9 +984,9 @@
             };
         });
 
-        // textarea选中监听（仅简洁模式显示弹窗）
+        // textarea选中监听
         outputEl.addEventListener('mouseup', function() {
-            if (!isCompactMode) return;
+            if (!AppState.isCompactMode) return;
 
             const start = outputEl.selectionStart;
             const end = outputEl.selectionEnd;
@@ -805,16 +1013,7 @@
                 const decoded = Tools.smart(selected);
                 const cleanDecoded = cleanPrefix(decoded);
 
-                outputEl.value = before + cleanDecoded + after;
-
-                // 双层requestAnimationFrame确保浏览器完成整个渲染周期
-                requestAnimationFrame(function() {
-                    requestAnimationFrame(function() {
-                        outputEl.focus();
-                        outputEl.setSelectionRange(start, start + cleanDecoded.length);
-                    });
-                });
-
+                updateTextareaBatch(outputEl, before + cleanDecoded + after, start, start + cleanDecoded.length);
                 setStatus('✓ 选中部分已解码', 'ok');
                 selectionPopup.classList.remove('show');
             } catch (e) {
@@ -822,7 +1021,6 @@
             }
         };
 
-        // 取消选中
         shadow.getElementById('btn-cancel-selection').onclick = function() {
             selectionPopup.classList.remove('show');
             outputEl.setSelectionRange(0, 0);
@@ -849,7 +1047,7 @@
 
         // 替换原文
         function doReplace() {
-            if (!selectedRange) {
+            if (!AppState.selectedRange) {
                 setStatus('✗ 无选区', 'err');
                 return;
             }
@@ -858,9 +1056,9 @@
                 finalText = Tools.unescape(finalText);
                 finalText = finalText.replace(/\x00/g, '');
 
-                selectedRange.deleteContents();
+                AppState.selectedRange.deleteContents();
 
-                let container = selectedRange.commonAncestorContainer;
+                let container = AppState.selectedRange.commonAncestorContainer;
                 while (container && container.nodeType !== 1) {
                     container = container.parentNode;
                 }
@@ -888,7 +1086,7 @@
                 }
 
                 if (isPreformatted) {
-                    selectedRange.insertNode(document.createTextNode(finalText));
+                    AppState.selectedRange.insertNode(document.createTextNode(finalText));
                 } else {
                     const frag = document.createDocumentFragment();
                     const lines = finalText.split('\n');
@@ -901,7 +1099,7 @@
                             frag.appendChild(document.createElement('br'));
                         }
                     }
-                    selectedRange.insertNode(frag);
+                    AppState.selectedRange.insertNode(frag);
                 }
 
                 removeUI();
@@ -915,12 +1113,12 @@
         if (replaceBtn2) replaceBtn2.onclick = doReplace;
 
         // ESC关闭事件管理
-        escListener = function(e) {
+        AppState.escListener = function(e) {
             if (e.key === 'Escape') {
                 removeUI();
             }
         };
-        document.addEventListener('keydown', escListener);
+        document.addEventListener('keydown', AppState.escListener);
 
         function setStatus(text, type) {
             statusEl.textContent = text;
