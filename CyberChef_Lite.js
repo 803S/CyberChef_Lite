@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      10.0
 // @description  智能多层解码工具 - 优化版 (单层RAF + 改进解码逻辑 + 状态管理)
-// @author       You
+// @author       lihua_dis
 // @match        *://*/*
 // @grant        GM_setClipboard
 // @run-at       document-end
