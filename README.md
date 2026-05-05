@@ -22,7 +22,7 @@
 
 1.  安装浏览器扩展：**Violentmonkey** (暴力猴) 或 **Tampermonkey** (油猴)。
 2.  点击扩展图标 -> **添加新脚本**。
-3.  将 V2.0 版本的 JS 代码完整粘贴到编辑器中。
+3.  将 JS 代码完整粘贴到编辑器中。
 4.  按 `Ctrl + S` 保存即可生效。
 
 ## 📖 使用指南
@@ -43,4 +43,4 @@
 *   **替换限制**：智能替换功能在部分复杂的 Canvas 或特殊渲染的编辑器中可能受限。
 
 ---
-Friend link: [linuxdo](https://linux.do/)
+***Friend link: [LINUX DO](https://linux.do/)***
